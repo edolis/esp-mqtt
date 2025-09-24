@@ -1,225 +1,240 @@
 #include "mqtt_outbox.h"
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
 #include "mqtt_config.h"
-#include "sys/queue.h"
-#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "ED_mqtt_qos1_queue.h"
+#include "mqtt_msg.h"
+#include <stdbool.h>
+#include <string.h>
 
-#ifndef CONFIG_MQTT_CUSTOM_OUTBOX
 static const char *TAG = "outbox";
 
-typedef struct outbox_item {
-    char *buffer;
-    int len;
-    int msg_id;
-    int msg_type;
-    int msg_qos;
+/* Minimal static ring for non-QoS1 messages */
+#define OUTBOX_RING_CAP 8
+
+struct outbox_item
+{
+    outbox_message_t msg;
+    pending_state_t state;
     outbox_tick_t tick;
-    pending_state_t pending;
-    STAILQ_ENTRY(outbox_item) next;
-} outbox_item_t;
-
-STAILQ_HEAD(outbox_list_t, outbox_item);
-
-struct outbox_t {
-    _Atomic uint64_t size;
-    struct outbox_list_t *list;
+    bool in_use;
 };
 
-outbox_handle_t outbox_init(void)
+struct outbox_t
 {
-    outbox_handle_t outbox = calloc(1, sizeof(struct outbox_t));
-    ESP_MEM_CHECK(TAG, outbox, return NULL);
-    outbox->list = calloc(1, sizeof(struct outbox_list_t));
-    ESP_MEM_CHECK(TAG, outbox->list, {free(outbox); return NULL;});
-    outbox->size = 0;
-    STAILQ_INIT(outbox->list);
-    return outbox;
+    struct outbox_item ring[OUTBOX_RING_CAP];
+    size_t size;
+    esp_mqtt_client_handle_t client;
+};
+
+static struct outbox_t g_outbox;
+
+outbox_handle_t outbox_init(esp_mqtt_client_handle_t client)
+{
+    memset(&g_outbox, 0, sizeof(g_outbox));
+    g_outbox.client = client;
+    /* Initialise QoS1 queue with dynamic slots enabled */
+    mqtt_qos1q_init();
+
+    ESP_LOGI(TAG, "Outbox initialised (QoS1 queue owned by client, allow_dynamic=1)");
+    return &g_outbox;
 }
 
-outbox_item_handle_t outbox_enqueue(outbox_handle_t outbox, outbox_message_handle_t message, outbox_tick_t tick)
+outbox_item_handle_t outbox_enqueue(outbox_handle_t outbox,
+                                    outbox_message_handle_t message,
+                                    outbox_tick_t tick)
 {
-    outbox_item_handle_t item = calloc(1, sizeof(outbox_item_t));
-    ESP_MEM_CHECK(TAG, item, return NULL);
-    item->msg_id = message->msg_id;
-    item->msg_type = message->msg_type;
-    item->msg_qos = message->msg_qos;
-    item->tick = tick;
-    item->len =  message->len + message->remaining_len;
-    item->pending = QUEUED;
-    item->buffer = heap_caps_malloc(message->len + message->remaining_len, MQTT_OUTBOX_MEMORY);
-    ESP_MEM_CHECK(TAG, item->buffer, {
-        free(item);
+    if (message->msg_qos == 1 && message->msg_type == MQTT_MSG_TYPE_PUBLISH) {
+        ESP_LOGE(TAG, "QoS1 should not enter outbox; check call path");
         return NULL;
-    });
-    memcpy(item->buffer, message->data, message->len);
-    if (message->remaining_data) {
-        memcpy(item->buffer + message->len, message->remaining_data, message->remaining_len);
     }
-    STAILQ_INSERT_TAIL(outbox->list, item, next);
-    outbox->size += item->len;
-    ESP_LOGD(TAG, "ENQUEUE msgid=%d, msg_type=%d, len=%d, size=%"PRIu64, message->msg_id, message->msg_type, message->len + message->remaining_len, outbox_get_size(outbox));
-    return item;
+
+    // QoS0/QoS2/control messages → store in static ring
+    for (int i = 0; i < OUTBOX_RING_CAP; ++i) {
+        if (!g_outbox.ring[i].in_use) {
+            g_outbox.ring[i].msg    = *message;
+            g_outbox.ring[i].state  = QUEUED;
+            g_outbox.ring[i].tick   = tick;
+            g_outbox.ring[i].in_use = true;
+            g_outbox.size += message->len + message->remaining_len;
+            return &g_outbox.ring[i];
+        }
+    }
+
+    ESP_LOGW(TAG, "Outbox ring full — dropping oldest control message");
+    g_outbox.ring[0].msg    = *message;
+    g_outbox.ring[0].state  = QUEUED;
+    g_outbox.ring[0].tick   = tick;
+    g_outbox.ring[0].in_use = true;
+    return &g_outbox.ring[0];
 }
+
+
 
 outbox_item_handle_t outbox_get(outbox_handle_t outbox, int msg_id)
 {
-    outbox_item_handle_t item;
-    STAILQ_FOREACH(item, outbox->list, next) {
-        if (item->msg_id == msg_id) {
-            return item;
+    for (int i = 0; i < OUTBOX_RING_CAP; ++i)
+    {
+        if (g_outbox.ring[i].in_use && g_outbox.ring[i].msg.msg_id == msg_id)
+        {
+            return &g_outbox.ring[i];
         }
     }
     return NULL;
 }
 
-outbox_item_handle_t outbox_dequeue(outbox_handle_t outbox, pending_state_t pending, outbox_tick_t *tick)
+outbox_item_handle_t outbox_dequeue(outbox_handle_t outbox,
+                                    pending_state_t pending,
+                                    outbox_tick_t *tick)
 {
-    outbox_item_handle_t item;
-    STAILQ_FOREACH(item, outbox->list, next) {
-        if (item->pending == pending) {
-            if (tick) {
-                *tick = item->tick;
+    for (int i = 0; i < OUTBOX_RING_CAP; ++i)
+    {
+        if (g_outbox.ring[i].in_use && g_outbox.ring[i].state == pending)
+        {
+            if (tick)
+                *tick = g_outbox.ring[i].tick;
+            return &g_outbox.ring[i];
+        }
+    }
+    return NULL;
+}
+
+esp_err_t outbox_delete_item(outbox_handle_t outbox,
+                             outbox_item_handle_t item_to_delete)
+{
+    if (!item_to_delete) {
+        return ESP_OK;
+    }
+
+    struct outbox_item *item = (struct outbox_item *)item_to_delete;
+
+    if (item->in_use) {
+        // 🔧 decrement size accounting
+        if (outbox) {
+            outbox->size -= item->msg.len + item->msg.remaining_len;
+            if (outbox->size < 0) {
+                ESP_LOGW(TAG, "Outbox size underflow detected, clamping to 0");
+                outbox->size = 0;
             }
-            return item;
         }
+        item->in_use = false;
     }
-    return NULL;
+
+    return ESP_OK;
 }
 
-esp_err_t outbox_delete_item(outbox_handle_t outbox, outbox_item_handle_t item_to_delete)
-{
-    outbox_item_handle_t item;
-    STAILQ_FOREACH(item, outbox->list, next) {
-        if (item == item_to_delete) {
-            STAILQ_REMOVE(outbox->list, item, outbox_item, next);
-            outbox->size -= item->len;
-            ESP_LOGD(TAG, "DELETE_ITEM msgid=%d, msg_type=%d, remain size=%"PRIu64, item_to_delete->msg_id, item_to_delete->msg_type, outbox_get_size(outbox));
-            free(item->buffer);
-            free(item);
-            return ESP_OK;
-        }
-    }
-    return ESP_FAIL;
-}
 
-uint8_t *outbox_item_get_data(outbox_item_handle_t item,  size_t *len, uint16_t *msg_id, int *msg_type, int *qos)
+uint8_t *outbox_item_get_data(outbox_item_handle_t item,
+                              size_t *len, uint16_t *msg_id,
+                              int *msg_type, int *qos)
 {
-    if (item) {
-        *len = item->len;
-        *msg_id = item->msg_id;
-        *msg_type = item->msg_type;
-        *qos = item->msg_qos;
-        return (uint8_t *)item->buffer;
-    }
-    return NULL;
+    if (!item)
+        return NULL;
+    struct outbox_item *it = (struct outbox_item *)item;
+    if (len)
+        *len = it->msg.len;
+    if (msg_id)
+        *msg_id = it->msg.msg_id;
+    if (msg_type)
+        *msg_type = it->msg.msg_type;
+    if (qos)
+        *qos = it->msg.msg_qos;
+    return it->msg.data;
 }
 
 esp_err_t outbox_delete(outbox_handle_t outbox, int msg_id, int msg_type)
 {
-    outbox_item_handle_t item, tmp;
-    STAILQ_FOREACH_SAFE(item, outbox->list, next, tmp) {
-        if (item->msg_id == msg_id && (0xFF & (item->msg_type)) == msg_type) {
-            STAILQ_REMOVE(outbox->list, item, outbox_item, next);
-            outbox->size -= item->len;
-            ESP_LOGD(TAG, "DELETE msgid=%d, msg_type=%d, remain size=%"PRIu64, msg_id, msg_type, outbox_get_size(outbox));
-            free(item->buffer);
-            free(item);
-            return ESP_OK;
-        }
-
+    if (msg_type == MQTT_MSG_TYPE_PUBLISH) {
+        mqtt_qos1q_on_published(msg_id);
     }
-    return ESP_FAIL;
+
+    outbox_item_handle_t it = outbox_get(outbox, msg_id);
+    if (it) {
+        return outbox_delete_item(outbox, it);  // ✅ reuse accounting logic
+    }
+
+    return ESP_OK;
 }
 
-esp_err_t outbox_set_pending(outbox_handle_t outbox, int msg_id, pending_state_t pending)
+esp_err_t outbox_set_pending(outbox_handle_t outbox,
+                             int msg_id, pending_state_t pending)
 {
-    outbox_item_handle_t item = outbox_get(outbox, msg_id);
-    if (item) {
-        item->pending = pending;
-        return ESP_OK;
-    }
-    return ESP_FAIL;
+    outbox_item_handle_t it = outbox_get(outbox, msg_id);
+    if (it)
+        ((struct outbox_item *)it)->state = pending;
+    return ESP_OK;
 }
 
 pending_state_t outbox_item_get_pending(outbox_item_handle_t item)
 {
-    if (item) {
-        return item->pending;
-    }
-    return QUEUED;
+    if (!item)
+        return QUEUED;
+    return ((struct outbox_item *)item)->state;
 }
 
-esp_err_t outbox_set_tick(outbox_handle_t outbox, int msg_id, outbox_tick_t tick)
+esp_err_t outbox_set_tick(outbox_handle_t outbox,
+                          int msg_id, outbox_tick_t tick)
 {
-    outbox_item_handle_t item = outbox_get(outbox, msg_id);
-    if (item) {
-        item->tick = tick;
-        return ESP_OK;
-    }
-    return ESP_FAIL;
+    outbox_item_handle_t it = outbox_get(outbox, msg_id);
+    if (it)
+        ((struct outbox_item *)it)->tick = tick;
+    return ESP_OK;
 }
 
-int outbox_delete_single_expired(outbox_handle_t outbox, outbox_tick_t current_tick, outbox_tick_t timeout)
+int outbox_delete_single_expired(outbox_handle_t outbox,
+                                 outbox_tick_t current_tick,
+                                 outbox_tick_t timeout)
 {
-    int msg_id = -1;
-    outbox_item_handle_t item;
-    STAILQ_FOREACH(item, outbox->list, next) {
-        if (current_tick - item->tick > timeout) {
-            STAILQ_REMOVE(outbox->list, item, outbox_item, next);
-            free(item->buffer);
-            outbox->size -= item->len;
-            msg_id = item->msg_id;
-            free(item);
-            ESP_LOGD(TAG, "DELETE_SINGLE_EXPIRED msgid=%d, remain size=%"PRIu64, msg_id, outbox_get_size(outbox));
-            return msg_id;
+    mqtt_qos1q_check_timeouts();
+
+    for (int i = 0; i < OUTBOX_RING_CAP; ++i) {
+        if (g_outbox.ring[i].in_use &&
+            (current_tick - g_outbox.ring[i].tick) > timeout) {
+
+            int id = g_outbox.ring[i].msg.msg_id;
+            // ✅ reuse accounting logic
+            outbox_delete_item(outbox, &g_outbox.ring[i]);
+            return id;
         }
-
     }
-    return msg_id;
+    return -1;
 }
 
-int outbox_delete_expired(outbox_handle_t outbox, outbox_tick_t current_tick, outbox_tick_t timeout)
+
+int outbox_delete_expired(outbox_handle_t outbox,
+                          outbox_tick_t current_tick,
+                          outbox_tick_t timeout)
 {
-    int deleted_items = 0;
-    outbox_item_handle_t item, tmp;
-    STAILQ_FOREACH_SAFE(item, outbox->list, next, tmp) {
-        if (current_tick - item->tick > timeout) {
-            STAILQ_REMOVE(outbox->list, item, outbox_item, next);
-            free(item->buffer);
-            outbox->size -= item->len;
-            ESP_LOGD(TAG, "DELETE_EXPIRED msgid=%d, remain size=%"PRIu64, item->msg_id, outbox_get_size(outbox));
-            free(item);
-            deleted_items ++;
-        }
+    /* Let the QoS1 queue handle its own timeouts */
+    mqtt_qos1q_check_timeouts();
 
+    int removed = 0;
+    for (int i = 0; i < OUTBOX_RING_CAP; ++i) {
+        if (g_outbox.ring[i].in_use &&
+            (current_tick - g_outbox.ring[i].tick) > timeout) {
+
+            // ✅ reuse accounting logic
+            outbox_delete_item(outbox, &g_outbox.ring[i]);
+            ++removed;
+        }
     }
-    return deleted_items;
+    return removed;
 }
 
-uint64_t outbox_get_size(outbox_handle_t outbox)
+
+size_t outbox_get_size(outbox_handle_t outbox)
 {
     return outbox->size;
 }
 
+
 void outbox_delete_all_items(outbox_handle_t outbox)
 {
-    outbox_item_handle_t item, tmp;
-    STAILQ_FOREACH_SAFE(item, outbox->list, next, tmp) {
-        STAILQ_REMOVE(outbox->list, item, outbox_item, next);
-        outbox->size -= item->len;
-        ESP_LOGD(TAG, "DELETE_ALL_ITEMS msgid=%d, msg_type=%d, remain size=%"PRIu64, item->msg_id, item->msg_type, outbox_get_size(outbox));
-        free(item->buffer);
-        free(item);
-    }
+    /* Clear both the static ring and the QoS1 queue */
+    memset(&g_outbox, 0, sizeof(g_outbox));
+    mqtt_qos1q_clear_all();
 }
+
 void outbox_destroy(outbox_handle_t outbox)
 {
     outbox_delete_all_items(outbox);
-    free(outbox->list);
-    free(outbox);
 }
-
-#endif /* CONFIG_MQTT_CUSTOM_OUTBOX */

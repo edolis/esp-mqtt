@@ -89,19 +89,51 @@ esp_err_t esp_mqtt5_parse_connack(esp_mqtt5_client_handle_t client, int *connect
     size_t len = client->mqtt_state.in_buffer_read_len;
     client->mqtt_state.in_buffer_read_len = 0;
     uint8_t ack_flag = 0;
-    if (mqtt5_msg_parse_connack_property(client->mqtt_state.in_buffer, len, &client->mqtt_state.
-                                         connection.information, &client->mqtt5_config->connect_property_info, &client->mqtt5_config->server_resp_property_info, connect_rsp_code, &ack_flag, &client->event.property->user_property) != ESP_OK) {
+
+    /* 🔍 Dump raw CONNACK packet */
+    // ESP_LOGI(TAG, "CONNACK raw length=%u", (unsigned)len);
+    // ESP_LOG_BUFFER_HEX(TAG, client->mqtt_state.in_buffer, len);
+
+    /* Parse CONNACK properties */
+    esp_err_t res = mqtt5_msg_parse_connack_property(client->mqtt_state.in_buffer, len,
+                                                     &client->mqtt_state.connection.information,
+                                                     &client->mqtt5_config->connect_property_info,
+                                                     &client->mqtt5_config->server_resp_property_info,
+                                                     connect_rsp_code,
+                                                     &ack_flag,
+                                                     &client->event.property->user_property);
+    if (res != ESP_OK) {
         ESP_LOGE(TAG, "Failed to parse CONNACK packet");
         return ESP_FAIL;
     }
+
+
+    /* 🔍 Log parsed results */
+    ESP_LOGI(TAG, "CONNACK parsed: return_code=%d (%s), session_present=%d",
+             *connect_rsp_code,
+             (*connect_rsp_code == MQTT_CONNECTION_ACCEPTED) ? "ACCEPTED" : "REFUSED",
+             (ack_flag & 0x01));
+
+    /* Log key MQTT v5 properties from broker */
+    ESP_LOGW(TAG, "Resetting 1 server_resp_property_info: max_qos was %u", client->mqtt5_config->server_resp_property_info.max_qos);
+
+    ESP_LOGI(TAG, "Broker properties: max_qos=%u, receive_max=%u, max_packet_size=%u, topic_alias_max=%u",
+             client->mqtt5_config->server_resp_property_info.max_qos,
+             client->mqtt5_config->server_resp_property_info.receive_maximum,
+             client->mqtt5_config->server_resp_property_info.maximum_packet_size,
+             client->mqtt5_config->server_resp_property_info.topic_alias_maximum);
+    ESP_LOGW(TAG, "Resetting 1 server_resp_property_info: max_qos is now %u", client->mqtt5_config->server_resp_property_info.max_qos);
+
     if (*connect_rsp_code == MQTT_CONNECTION_ACCEPTED) {
         ESP_LOGD(TAG, "Connected");
         client->event.session_present = ack_flag & 0x01;
         return ESP_OK;
     }
+
     esp_mqtt5_print_error_code(client, *connect_rsp_code);
     return ESP_FAIL;
 }
+
 
 esp_err_t esp_mqtt5_get_publish_data(esp_mqtt5_client_handle_t client, uint8_t *msg_buf, size_t msg_read_len, char **msg_topic, size_t *msg_topic_len, char **msg_data, size_t *msg_data_len)
 {
